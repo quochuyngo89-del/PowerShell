@@ -1,0 +1,9 @@
+##Finding Local Profiles on Domain Computers
+$ProfileName = 'Username'
+    $Computers = Get-ADComputer -Filter * | Select-Object -ExpandProperty Name
+    foreach ($computer in $Computers) {
+        $Path = "\\$computer\c$\Users\$ProfileName"
+        if ((Test-Path $Path)) {
+            Write-Host "User profile found on: $computer"
+        }
+    }

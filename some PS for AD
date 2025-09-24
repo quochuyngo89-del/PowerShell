@@ -1,0 +1,17 @@
+    #find email, manager, name and title of a user
+  get-aduser huy.ngo -Properties  mail,manager, SamAccountName,Title,ManagerUserName | select mail,manager, SamAccountName,Title,ManagerUserName
+
+  
+  #find group I am in
+  Get-ADPrincipalGroupMembership huy.ngo | Select-Object name
+
+  # this is a cmd line. find all the shared drives
+  net use 
+
+  #PS to get all the installed apps 
+  Get-WmiObject  -Class win32_product
+
+
+#PS to uninstall app by identify number
+$application = Get-WmiObject -Class Win32_Product -Filter "IdentifyingNumber = '{58A3001D-B675-4D67-A5A1-0FA9F08CF7CA}'"
+$application.Uninstall()

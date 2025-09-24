@@ -1,0 +1,7 @@
+$UserList = Import-Csv -Path "C:\Users\Huy.Ngo\Documents\users.csv"
+
+ForEach ($User in $UserList) {
+    $Email = $User.EmailAddress
+   Get-DistributionGroup | Where-Object { (Get-DistributionGroupMember $_.Name).PrimarySmtpAddress -contains $Email } | Select-Object @{Name="mail";Expression={$Email}}, Name, PrimarySmtpAddress | Export-Csv -Path "C:\Users\Huy.Ngo\Documents\users\$($Email)_DistroGroups.csv" -NoTypeInformation
+
+}

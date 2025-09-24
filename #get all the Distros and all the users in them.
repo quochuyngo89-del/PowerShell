@@ -1,0 +1,6 @@
+#get all the Distros and all the users in them. 
+    Get-DistributionGroup -ResultSize Unlimited | ForEach-Object {
+        $GroupName = $_.DisplayName
+        Get-DistributionGroupMember -Identity $GroupName | Select-Object @{Name="Group";Expression={$GroupName}}, Name, PrimarySmtpAddress | Export-Csv -Path "C:\Users\Huy.Ngo\Documents\book2.csv" -NoTypeInformation
+    }
+

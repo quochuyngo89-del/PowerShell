@@ -1,0 +1,7 @@
+CHKDSK C: /F /V /R /offlinescanandfix
+
+DISM /Online /Cleanup-Image /StartComponentCleanup
+DISM /Online /Cleanup-Image /CheckHealth
+DISM /Online /Cleanup-Image /ScanHealth
+DISM /Online /Cleanup-Image /RestoreHealth
+SFC /scannow

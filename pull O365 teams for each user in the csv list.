@@ -1,0 +1,9 @@
+Install-Module -Name MicrosoftTeams -Force -AllowClobber
+Connect-MicrosoftTeams
+
+$UserList = Import-Csv -Path "C:\Users\Huy.Ngo\Documents\users.csv"
+ForEach ($User in $UserList) {
+    $Email = $User.EmailAddress
+   Get-Team -User $Email | Select-Object  @{Name="mail";Expression={$Email}}, DisplayName, Description, Visibility | Export-Csv -Path "C:\Users\Huy.Ngo\Documents\usersTeams\$($Email)Team.csv" -NoTypeInformation
+
+}

@@ -1,0 +1,732 @@
+<#
+.SYNOPSIS
+  Patch Audit (Local + Remote) with optional consolidated report.
+  Minimal parameters. Uses PSWritePDF to produce a simple PDF that embeds the HTML source as text.
+
+.USAGE
+  .\PatchAudit-Consolidated.ps1
+  .\PatchAudit-Consolidated.ps1 -ComputerName "Com1","Com2" -Consolidated -MonthsBack 12
+
+.PARAMETERS
+  -ComputerName : (optional) Remote computers; omit for local-only.
+  -Consolidated : (optional) One merged HTML/PDF. Default: False
+  -MonthsBack   : (optional) Months of history. Default: 1
+#>
+
+[CmdletBinding()]
+param(
+    [string[]]$ComputerName,
+    [string]$ComputerListPath,
+    [switch]$Consolidated,
+    [int]$MonthsBack = 1
+)
+
+function Write-Info { param([string]$Message) Write-Host ("[INFO ] {0}" -f $Message) -ForegroundColor Cyan }
+function Write-Err  { param([string]$Message) Write-Host ("[ERROR] {0}" -f $Message) -ForegroundColor Red }
+
+
+# === Expand computer list from -ComputerName AND optional -ComputerListPath / file paths ===
+# Accepts either explicit names: -ComputerName "HPG-MGMT","HPGMC"
+# OR a newline-separated TXT/CSV file via -ComputerListPath
+# OR passing a file path as the only item in -ComputerName (mixing supported too)
+if (-not $ComputerName) { $ComputerName = @() }
+
+$__allNames = @()
+
+# Add any directly specified names
+if ($ComputerName) {
+    $__allNames += $ComputerName
+}
+
+# If any -ComputerName entries are valid file paths, treat them as list files too
+$__files = @()
+foreach ($__item in $ComputerName) {
+    if (Test-Path -LiteralPath $__item) { $__files += $__item }
+}
+
+# Add explicit -ComputerListPath if provided
+if ($ComputerListPath) { $__files += $ComputerListPath }
+
+# Load names from any files discovered (newline-separated; ignores blanks and lines starting with '#')
+foreach ($__f in $__files) {
+    try {
+        $__loaded = Get-Content -LiteralPath $__f | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Where-Object { -not $_.StartsWith('#') }
+        Write-Info ("Loaded {0} computer(s) from {1}" -f $__loaded.Count, $__f)
+        $__allNames += $__loaded
+    } catch {
+        Write-Err ("Failed to read computer list '{0}': {1}" -f $__f, $_.Exception.Message)
+    }
+}
+
+# De-duplicate
+if ($__allNames) {
+    $ComputerName = $__allNames | Sort-Object -Unique
+} else {
+    $ComputerName = @()
+}
+
+# Normalize ComputerName when omitted
+if (-not $ComputerName) { $ComputerName = @() }
+
+# =============================
+# HARD-CODED SMTP (edit here)
+# =============================
+$SmtpConfig = @{
+    From       = 'procurement@hpgroupllc.com'
+    To         = 'janeira.stclare@reverba.com'
+    Cc         = ''              # optional
+    Bcc        = 'erry@wowrack.com'              # optional
+    SmtpServer = 'smtp.office365.com'
+    SmtpPort   = 587
+    UseSsl     = $true
+    SmtpUser   = 'procurement@hpgroupllc.com'   # leave empty for anonymous/relay
+    SmtpPass   = '9x*F7Cja15X1'                    # leave empty if SmtpUser is empty
+}
+
+# Optional: filter noisy titles
+$ExcludeTitleLike = @()  # e.g. "*Defender*","*Preview*"
+
+# =============================
+# Utilities
+# =============================
+# Cross-version HTML encoder (PS 5.1 / PS 7+)
+function HtmlEncode {
+    param([string]$Text)
+    try { return [System.Net.WebUtility]::HtmlEncode($Text) } catch {}
+    try {
+        Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
+        return [System.Web.HttpUtility]::HtmlEncode($Text)
+    } catch {}
+    if ($null -eq $Text) { return "" }
+    $t = "$Text"
+    $t = $t -replace '&','&amp;'
+    $t = $t -replace '<','&lt;'
+    $t = $t -replace '>','&gt;'
+    $t = $t -replace '"','&quot;'
+    return $t
+}
+
+
+function Ensure-OutputDir { param([string]$Path) if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null } }
+function Cleanup-OldReports { param([string]$Path,[int]$KeepDays=30)
+    if (Test-Path $Path) {
+        $cut = (Get-Date).AddDays(-$KeepDays)
+        Get-ChildItem -Path $Path -File | Where-Object { $_.LastWriteTime -lt $cut } | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Output dir
+$OutputDir = Join-Path -Path $PSScriptRoot -ChildPath 'PatchAudit_Reports'
+
+function Ensure-Tls12 {
+    try {
+        Write-Info "Ensuring TLS 1.2 for web requests..."
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    } catch {
+        Write-Err ("Failed to set TLS 1.2: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Get-EdgeInfo {
+    $paths = @(
+        "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) {
+            Write-Info ("Microsoft Edge is already installed at {0}." -f $p)
+            return $p
+        }
+    }
+    Write-Info "Microsoft Edge not detected."
+    return $null
+}
+
+# =============================
+# Module handling
+# =============================
+function Get-ModuleVersion {
+    param([string]$Name)
+    $m = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+    if ($m) { return $m.Version }
+    return $null
+}
+
+function Ensure-Module {
+    param([string]$Name,[string]$MinVersion)
+    try {
+        Ensure-Tls12
+
+        $existingVersion = Get-ModuleVersion -Name $Name
+        if ($existingVersion) {
+            Write-Info ("Module {0} found (v{1})." -f $Name, $existingVersion)
+        }
+
+        $nuget = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue
+        if (-not $nuget) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
+        }
+
+        $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction SilentlyContinue
+        if ($repo) {
+            if ($repo.InstallationPolicy -ne 'Trusted') {
+                Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+            }
+        }
+
+        $mod = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+        $needsInstall = $true
+        if ($mod) {
+            if ($MinVersion) {
+                if ([Version]$mod.Version -ge [Version]$MinVersion) { $needsInstall = $false }
+            } else {
+                $needsInstall = $false
+            }
+        }
+        if ($needsInstall) {
+            Write-Info ("Installing module {0}..." -f $Name)
+            if ($MinVersion) {
+                Install-Module -Name $Name -MinimumVersion $MinVersion -Force -Scope AllUsers -Confirm:$false | Out-Null
+            } else {
+                Install-Module -Name $Name -Force -Scope AllUsers -Confirm:$false | Out-Null
+            }
+        }
+        Import-Module $Name -ErrorAction Stop
+        $version = Get-ModuleVersion -Name $Name
+        if ($version) { Write-Info ("Module {0} ready (v{1})." -f $Name, $version) }
+    } catch {
+        Write-Err ("Ensure-Module '{0}' failed: {1}" -f $Name, $_.Exception.Message)
+    }
+}
+
+function Ensure-ModuleRemote {
+    param([string]$ComputerName,[string]$Name,[string]$MinVersion)
+    $sb = {
+        param($Name,$MinVersion)
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $nuget = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue
+            if (-not $nuget) {
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
+            }
+            $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction SilentlyContinue
+            if ($repo) {
+                if ($repo.InstallationPolicy -ne 'Trusted') {
+                    Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+                }
+            }
+
+            $mod = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+            $needsInstall = $true
+            if ($mod) {
+                if ($MinVersion) {
+                    if ([Version]$mod.Version -ge [Version]$MinVersion) { $needsInstall = $false }
+                } else {
+                    $needsInstall = $false
+                }
+            }
+            if ($needsInstall) {
+                if ($MinVersion) {
+                    Install-Module -Name $Name -MinimumVersion $MinVersion -Force -Scope AllUsers -Confirm:$false | Out-Null
+                } else {
+                    Install-Module -Name $Name -Force -Scope AllUsers -Confirm:$false | Out-Null
+                }
+            }
+        } catch {
+            throw "Remote '$Name' ensure failed: $($_.Exception.Message)"
+        }
+    }
+    Invoke-Command -ComputerName $ComputerName -ScriptBlock $sb -ArgumentList $Name,$MinVersion
+}
+
+# =============================
+# Environment prereqs (local)
+# =============================
+function Ensure-PreReqs {
+    Ensure-Module -Name 'PSWindowsUpdate' -MinVersion '2.0.0.0'
+    Ensure-Module -Name 'PSWritePDF'
+    Get-EdgeInfo | Out-Null
+}
+
+# =============================
+# Data collection (local + remote)
+# =============================
+function Get-IdentityBlock {
+    try {
+        $cs  = Get-CimInstance Win32_ComputerSystem
+        $os  = Get-CimInstance Win32_OperatingSystem
+        $enc = Get-CimInstance Win32_SystemEnclosure
+        $ip  = (Get-NetIPAddress -AddressFamily IPv4 |
+               Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
+               Sort-Object -Property SkipAsSource |
+               Select-Object -First 1 -ExpandProperty IPAddress)
+
+        [pscustomobject]@{
+            Computer        = $env:COMPUTERNAME
+            Domain          = $cs.Domain
+            Manufacturer    = $cs.Manufacturer
+            Model           = $cs.Model
+            SerialNumber    = ($enc | Select-Object -ExpandProperty SerialNumber -ErrorAction SilentlyContinue)
+            IPv4            = $ip
+            OperatingSystem = ("{0} {1}" -f $os.Caption, $os.OSArchitecture)
+        }
+    } catch {
+        throw "Local identity failed: $($_.Exception.Message)"
+    }
+}
+
+function Get-RemoteIdentity {
+    param([string]$ComputerName)
+    $sb = {
+        try {
+            $cs  = Get-CimInstance Win32_ComputerSystem
+            $os  = Get-CimInstance Win32_OperatingSystem
+            $enc = Get-CimInstance Win32_SystemEnclosure
+            $ip  = (Get-NetIPAddress -AddressFamily IPv4 |
+                   Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
+                   Sort-Object -Property SkipAsSource |
+                   Select-Object -First 1 -ExpandProperty IPAddress)
+
+            [pscustomobject]@{
+                Computer        = $env:COMPUTERNAME
+                Domain          = $cs.Domain
+                Manufacturer    = $cs.Manufacturer
+                Model           = $cs.Model
+                SerialNumber    = ($enc | Select-Object -ExpandProperty SerialNumber -ErrorAction SilentlyContinue)
+                IPv4            = $ip
+                OperatingSystem = ("{0} {1}" -f $os.Caption, $os.OSArchitecture)
+            }
+        } catch {
+            throw "Remote identity failed: $($_.Exception.Message)"
+        }
+    }
+    Invoke-Command -ComputerName $ComputerName -ScriptBlock $sb
+}
+
+function Get-PatchHistory {
+    param([int]$MonthsBack,[string[]]$ExcludeTitleLike)
+    Write-Info "Collecting Windows Update history (PSWindowsUpdate)..."
+    Import-Module PSWindowsUpdate -ErrorAction Stop
+    $hist = Get-WUHistory -Last 2000
+    $start = $null
+    if ($MonthsBack -gt 0) {
+        $start = (Get-Date).AddMonths(-$MonthsBack)
+        $hist = $hist | Where-Object { $_.Date -ge $start }
+        Write-Info ("Filtered to last {0} month(s)." -f $MonthsBack)
+    }
+    if ($ExcludeTitleLike) {
+        if ($ExcludeTitleLike.Count -gt 0) {
+            foreach ($pat in $ExcludeTitleLike) {
+                $hist = $hist | Where-Object { $_.Title -notlike $pat }
+            }
+        }
+    }
+
+    $rows = $hist | Select-Object Date, Title,
+        @{n='OperationName';e={$_.Operation | ForEach-Object { $_.ToString() } }},
+        @{n='Result';e={$_.Result | ForEach-Object { $_.ToString() } }}
+
+    $summary = [pscustomobject]@{ Installed=0; Uninstalled=0; Success=0; Failed=0; SuccessWithError=0; Aborted=0; InProgress=0 }
+    foreach ($row in $rows) {
+        $op = $row.OperationName
+        $res = "$($row.Result)".Trim()
+        if ($op -eq 'Installation') {
+            $summary.Installed++
+            if ($res -eq 'Succeeded') { $summary.Success++ }
+            elseif ($res -eq 'Failed') { $summary.Failed++ }
+            elseif ($res -like 'Succeeded*Errors*') { $summary.SuccessWithError++ }
+            elseif ($res -match 'Aborted|Cancelled') { $summary.Aborted++ }
+        } elseif ($op -eq 'Uninstallation') {
+            $summary.Uninstalled++
+        }
+    }
+
+    [pscustomobject]@{
+        Rows       = $rows
+        Summary    = $summary
+        StartDate  = $start
+        MonthsBack = $MonthsBack
+    }
+}
+
+function Get-RemotePatchHistory {
+    param([string]$ComputerName,[int]$MonthsBack,[string[]]$ExcludeTitleLike)
+    Write-Info ("Ensuring PSWindowsUpdate on {0}..." -f $ComputerName)
+    Ensure-ModuleRemote -ComputerName $ComputerName -Name 'PSWindowsUpdate' -MinVersion '2.0.0.0'
+    $sb = {
+        param($MonthsBack,$ExcludeTitleLike)
+        Import-Module PSWindowsUpdate -ErrorAction Stop
+        $hist = Get-WUHistory -Last 2000
+        $start = $null
+        if ($MonthsBack -gt 0) {
+            $start = (Get-Date).AddMonths(-$MonthsBack)
+            $hist = $hist | Where-Object { $_.Date -ge $start }
+        }
+        if ($ExcludeTitleLike) {
+            if ($ExcludeTitleLike.Count -gt 0) {
+                foreach ($pat in $ExcludeTitleLike) {
+                    $hist = $hist | Where-Object { $_.Title -notlike $pat }
+                }
+            }
+        }
+        $rows = $hist | Select-Object Date, Title,
+            @{n='OperationName';e={$_.Operation | ForEach-Object { $_.ToString() } }},
+            @{n='Result';e={$_.Result | ForEach-Object { $_.ToString() } }}
+        $summary = [pscustomobject]@{ Installed=0; Uninstalled=0; Success=0; Failed=0; SuccessWithError=0; Aborted=0; InProgress=0 }
+        foreach ($row in $rows) {
+            $op = $row.OperationName
+            $res = "$($row.Result)".Trim()
+            if ($op -eq 'Installation') {
+                $summary.Installed++
+                if ($res -eq 'Succeeded') { $summary.Success++ }
+                elseif ($res -eq 'Failed') { $summary.Failed++ }
+                elseif ($res -like 'Succeeded*Errors*') { $summary.SuccessWithError++ }
+                elseif ($res -match 'Aborted|Cancelled') { $summary.Aborted++ }
+            } elseif ($op -eq 'Uninstallation') {
+                $summary.Uninstalled++
+            }
+        }
+        [pscustomobject]@{
+            Rows       = $rows
+            Summary    = $summary
+            StartDate  = $start
+            MonthsBack = $MonthsBack
+        }
+    }
+    Invoke-Command -ComputerName $ComputerName -ScriptBlock $sb -ArgumentList $MonthsBack,$ExcludeTitleLike
+}
+
+# =============================
+# HTML report (single + consolidated)
+# =============================
+$Global:AuditCss = @"
+body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; }
+h1,h2,h3 { margin: 0 0 8px 0; }
+.small { color:#666; font-size: 12px }
+.header { display:flex; gap:24px; align-items:flex-start; margin-bottom:12px }
+.card { border:1px solid #ddd; border-radius:10px; padding:12px; margin:10px 0; box-shadow: 0 2px 6px rgba(0,0,0,.05) }
+.kv { display:grid; grid-template-columns: 180px 1fr; row-gap:6px; }
+.kv div:first-child { color:#666; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+th { background: #f0f3f7 }
+.badge { display:inline-block; background:#eef3ff; border:1px solid #cfe0ff; border-radius:999px; padding:2px 8px; margin-right:6px }
+.summary { display:flex; flex-wrap:wrap; gap:10px }
+footer { margin-top: 16px; color:#666; font-size: 12px }
+"@
+
+function New-ReportHtml {
+    param([pscustomobject]$Identity,[pscustomobject]$Data)
+    $summary = $Data.Summary
+    $rows = $Data.Rows
+    $startLine = if ($Data.StartDate) { "History since: $($Data.StartDate.ToString('yyyy-MM-dd'))" } else { "History range: All available" }
+
+    $rowsHtml = ($rows | Sort-Object Date -Descending | ForEach-Object {
+@"
+<tr>
+    <td>$($_.Date)</td>
+    <td>$(HtmlEncode $_.Title)</td>
+    <td>$($_.OperationName)</td>
+    <td>$($_.Result)</td>
+</tr>
+"@
+    }) -join "`n"
+
+@"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<title>Patch Audit - $($Identity.Computer)</title>
+<style>$Global:AuditCss</style>
+</head>
+<body>
+  <div class='header'>
+    <div>
+      <h1>Patch Audit</h1>
+      <div class='small'>$startLine</div>
+    </div>
+  </div>
+
+  <div class='card'>
+    <h3>Host Identity</h3>
+    <div class='kv'>
+      <div>Computer</div><div>$($Identity.Computer)</div>
+      <div>Domain</div><div>$($Identity.Domain)</div>
+      <div>OS</div><div>$($Identity.OperatingSystem)</div>
+      <div>IPv4</div><div>$($Identity.IPv4)</div>
+      <div>Model</div><div>$($Identity.Manufacturer) $($Identity.Model)</div>
+      <div>Serial</div><div>$($Identity.SerialNumber)</div>
+    </div>
+  </div>
+
+  <div class='card'>
+    <h3>Summary</h3>
+    <div class='summary'>
+      <span class='badge'>Installed: $($summary.Installed)</span>
+      <span class='badge'>Uninstalled: $($summary.Uninstalled)</span>
+      <span class='badge'>Success: $($summary.Success)</span>
+      <span class='badge'>Success (With Errors): $($summary.SuccessWithError)</span>
+      <span class='badge'>Failed: $($summary.Failed)</span>
+      <span class='badge'>Aborted: $($summary.Aborted)</span>
+    </div>
+  </div>
+
+  <div class='card'>
+    <h3>Entries</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Title</th><th>Operation</th><th>Result</th></tr></thead>
+      <tbody>
+        $rowsHtml
+      </tbody>
+    </table>
+  </div>
+
+  <footer>Generated on $(Get-Date)</footer>
+</body>
+</html>
+"@
+}
+
+function New-ConsolidatedHtml {
+    param([array]$HostResults) # array of @{ Identity=...; Data=... }
+    $allRows = @()
+    $totals = [pscustomobject]@{ Installed=0; Uninstalled=0; Success=0; Failed=0; SuccessWithError=0; Aborted=0 }
+    $since = $null
+
+    foreach ($hr in $HostResults) {
+        $id = $hr.Identity
+        $d  = $hr.Data
+        if ($d.StartDate) {
+            if (-not $since) { $since = $d.StartDate }
+            elseif ($d.StartDate -lt $since) { $since = $d.StartDate }
+        }
+
+        $totals.Installed        = $totals.Installed        + $d.Summary.Installed
+        $totals.Uninstalled      = $totals.Uninstalled      + $d.Summary.Uninstalled
+        $totals.Success          = $totals.Success          + $d.Summary.Success
+        $totals.Failed           = $totals.Failed           + $d.Summary.Failed
+        $totals.SuccessWithError = $totals.SuccessWithError + $d.Summary.SuccessWithError
+        $totals.Aborted          = $totals.Aborted          + $d.Summary.Aborted
+
+        $d.Rows | ForEach-Object {
+            $allRows += [pscustomobject]@{
+                Computer      = $id.Computer
+                Date          = $_.Date
+                Title         = $_.Title
+                OperationName = $_.OperationName
+                Result        = $_.Result
+            }
+        }
+    }
+
+    $startLine = if ($since) { "History since: $($since.ToString('yyyy-MM-dd'))" } else { "History range: All available" }
+    $rowsHtml = ($allRows | Sort-Object Date -Descending | ForEach-Object {
+@"
+<tr>
+    <td>$($_.Computer)</td>
+    <td>$($_.Date)</td>
+    <td>$(HtmlEncode $_.Title)</td>
+    <td>$($_.OperationName)</td>
+    <td>$($_.Result)</td>
+</tr>
+"@
+    }) -join "`n"
+
+@"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<title>Patch Audit - Consolidated</title>
+<style>$Global:AuditCss</style>
+</head>
+<body>
+  <div class='header'>
+    <div>
+      <h1>Patch Audit (Consolidated)</h1>
+      <div class='small'>$startLine</div>
+    </div>
+  </div>
+
+  <div class='card'>
+    <h3>Overall Summary</h3>
+    <div class='summary'>
+      <span class='badge'>Installed: $($totals.Installed)</span>
+      <span class='badge'>Uninstalled: $($totals.Uninstalled)</span>
+      <span class='badge'>Success: $($totals.Success)</span>
+      <span class='badge'>Success (With Errors): $($totals.SuccessWithError)</span>
+      <span class='badge'>Failed: $($totals.Failed)</span>
+      <span class='badge'>Aborted: $($totals.Aborted)</span>
+    </div>
+  </div>
+
+  <div class='card'>
+    <h3>Entries</h3>
+    <table>
+      <thead><tr><th>Computer</th><th>Date</th><th>Title</th><th>Operation</th><th>Result</th></tr></thead>
+      <tbody>
+        $rowsHtml
+      </tbody>
+    </table>
+  </div>
+
+  <footer>Generated on $(Get-Date)</footer>
+</body>
+</html>
+"@
+}
+
+# =============================
+# PDF conversion (PSWritePDF simple)
+# =============================
+<#function Convert-HTMLToPDF {
+    param([string]$FilePath,[string]$OutputFilePath)
+    try {
+        $pdfModule = Get-Module -ListAvailable -Name PSWritePDF
+        if ($pdfModule) {
+            $htmlText = Get-Content -LiteralPath $FilePath -Raw
+            New-Pdf -FilePath $OutputFilePath {
+                if (Get-Command -Name New-PdfText -ErrorAction SilentlyContinue) {
+                    New-PdfText -Text "Patch Audit HTML (source) Ã¢â‚¬â€ PSWritePDF simple export"
+                    if (Get-Command -Name New-PdfNewLine -ErrorAction SilentlyContinue) { New-PdfNewLine }
+                    New-PdfText -Text $htmlText
+                }
+            } | Out-Null
+            if (Test-Path $OutputFilePath) { return $true }
+            return $false
+        } else {
+            Write-Info "PSWritePDF not found. Skipping PDF."
+            return $false
+        }
+    } catch {
+        Write-Err ("PDF conversion failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}#>
+
+# =============================
+# Email
+# =============================
+function Send-ReportEmail {
+    param([string[]]$Attachments,[string]$Subject,[string]$BodyHtml)
+    if (-not $SmtpConfig.To) { return }
+    Write-Info ("Sending email to {0} ..." -f $SmtpConfig.To)
+    try {
+        $mailParams = @{
+            From       = $SmtpConfig.From
+            To         = $SmtpConfig.To
+            Subject    = $Subject
+            SmtpServer = $SmtpConfig.SmtpServer
+            Port       = $SmtpConfig.SmtpPort
+            UseSsl     = [bool]$SmtpConfig.UseSsl
+            Body       = $BodyHtml
+            BodyAsHtml = $true
+            ErrorAction= 'Stop'
+        }
+        if ($SmtpConfig.Cc)  { $mailParams.Cc  = $SmtpConfig.Cc }
+        if ($SmtpConfig.Bcc) { $mailParams.Bcc = $SmtpConfig.Bcc }
+        if ($Attachments) {
+            if ($Attachments.Count -gt 0) { $mailParams.Attachments = $Attachments }
+        }
+        if ($SmtpConfig.SmtpUser) {
+            $sec = ConvertTo-SecureString $SmtpConfig.SmtpPass -AsPlainText -Force
+            $cred = [pscredential]::new($SmtpConfig.SmtpUser,$sec)
+            $mailParams.Credential = $cred
+        }
+        Send-MailMessage @mailParams
+        Write-Info "Email sent."
+    } catch {
+        Write-Err ("Email send failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+# =============================
+# Main
+# =============================
+$script:StartTime = Get-Date
+try {
+    Write-Info ("Starting Patch Audit at {0}" -f (Get-Date))
+    Ensure-OutputDir -Path $OutputDir
+    Ensure-PreReqs
+
+    $attachments = @()
+    $hostResults = @()
+
+    if ($ComputerName.Count -gt 0) {
+        foreach ($comp in $ComputerName) {
+            Write-Info ("Starting Patch Audit for {0}" -f $comp)
+            try {
+                Write-Info ("=== Auditing remote: {0} ===" -f $comp)
+                $identity = Get-RemoteIdentity -ComputerName $comp
+                $data     = Get-RemotePatchHistory -ComputerName $comp -MonthsBack $MonthsBack -ExcludeTitleLike $ExcludeTitleLike
+                $hostResults += @{ Identity = $identity; Data = $data }
+            } catch {
+                Write-Err ("Remote audit failed for {0}: {1}" -f $comp, $_.Exception.Message)
+            }
+        }
+    } else {
+        Write-Info "Starting Patch Audit for LOCALHOST"
+        Write-Info "=== Auditing local host ==="
+        $identity = Get-IdentityBlock
+        $data     = Get-PatchHistory -MonthsBack $MonthsBack -ExcludeTitleLike $ExcludeTitleLike
+        $hostResults += @{ Identity = $identity; Data = $data }
+    }
+
+    # Output
+    if ($Consolidated) {
+        $html = New-ConsolidatedHtml -HostResults $hostResults
+        $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $baseName = if ($hostResults.Count -gt 1) { "PatchAudit_Consolidated_${ts}_$($hostResults.Count)hosts" } else { "$($hostResults[0].Identity.Computer)_PatchAudit_${ts}" }
+        $htmlPath = Join-Path $OutputDir ($baseName + '.html')
+        $pdfPath  = Join-Path $OutputDir ($baseName + '.pdf')
+        Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8
+        Write-Info ("Consolidated HTML report saved: {0}" -f $htmlPath)
+        $pdfOK = Convert-HTMLToPDF -FilePath $htmlPath -OutputFilePath $pdfPath
+        if ($pdfOK) {
+            if (Test-Path $pdfPath) { $attachments += $pdfPath } else { $attachments += $pdfPath }
+        } else {
+            $attachments += $pdfPath
+        }
+    } else {
+        foreach ($hr in $hostResults) {
+            $id = $hr.Identity; $d = $hr.Data
+            $html = New-ReportHtml -Identity $id -Data $d
+            $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+            $baseName = "$($id.Computer)_PatchAudit_$ts"
+            $htmlPath = Join-Path $OutputDir ($baseName + '.html')
+            $pdfPath  = Join-Path $OutputDir ($baseName + '.pdf')
+            Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8
+            Write-Info ("[{0}] HTML report saved: {1}" -f $id.Computer, $htmlPath)
+            $pdfOK = Convert-HTMLToPDF -FilePath $htmlPath -OutputFilePath $pdfPath
+			Start-Sleep -Seconds 3
+            if ($pdfOK) {
+                if (Test-Path $pdfPath) { $attachments += $pdfPath } else { $attachments += $pdfPath }
+            } else {
+                $attachments += $pdfPath
+            }
+            Write-Info ("Remote Patch Audit script executed on {0}." -f $id.Computer)
+        }
+    }
+
+    Cleanup-OldReports -Path $OutputDir -KeepDays 30
+
+    # Email
+    $subject = if ($Consolidated) {
+        "Patch Audit - Consolidated - $(Get-Date -Format 'yyyy-MM-dd')"
+    } else {
+        if ($ComputerName.Count -gt 0) {
+            "Patch Audit - $($ComputerName.Count) host(s) - $(Get-Date -Format 'yyyy-MM-dd')"
+        } else {
+            "Patch Audit - $env:COMPUTERNAME - $(Get-Date -Format 'yyyy-MM-dd')"
+        }
+    }
+    $body = "Please find attached the patch audit report(s).<br/>Generated on $(Get-Date)."
+    Send-ReportEmail -Attachments $attachments -Subject $subject -BodyHtml $body
+
+    $elapsed = [int]([math]::Round(((Get-Date) - $script:StartTime).TotalSeconds,0))
+    Write-Info ("Completed in {0}s" -f $elapsed)
+} catch {
+    Write-Err ("Run failed: {0}" -f $_.Exception.Message)
+    exit 1
+}

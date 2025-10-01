@@ -17,3 +17,6 @@ HPG-OCP-DC
 HPG-NJ-HYPERV1
 HPGHE
 CURIUM
+
+to run the script do use this 
+.\PatchAudit-Consolidated.ps1 -ComputerListPath C:\Scripts\PatchComputer.txt
